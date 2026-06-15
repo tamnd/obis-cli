@@ -2,74 +2,73 @@ package obis
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"strconv"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes obis as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
+// domain.go exposes OBIS as a kit Domain: a driver that a multi-domain host
+// (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/obis-cli/obis"
 //
 // exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// obis:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone obis binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// "github.com/lib/pq"`. The init below registers it; the host then
+// dereferences obis:// URIs by routing to the operations Register installs.
+// The same Domain also builds the standalone obis binary (see cli.NewApp),
+// so the binary and a host share one source of truth.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the obis driver. It carries no state; the per-run client is
+// Domain is the OBIS driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "obis",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "obis",
-			Short:  "A command line for obis.",
-			Long: `A command line for obis.
+			Short:  "Ocean Biodiversity Information System CLI",
+			Long: `obis reads public OBIS data over plain HTTPS, shapes it into clean
+records, and prints output that pipes into the rest of your tools.
+No API key, nothing to run alongside it.
 
-obis reads public obis data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+OBIS is the world's largest open-access repository for marine species
+occurrence data, with 200M+ records from 6,700+ datasets.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/obis-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every OBIS operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `obis page` and
-	// `ant get obis://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "occurrence", Group: "read", List: true,
+		Summary: "Search species occurrence records",
+		Args:    []kit.Arg{{Name: "scientific-name", Help: "scientific name to search for"}}},
+		searchOccurrences)
 
-	// List op: members of a page, the home of `obis links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// obis://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "taxon", Group: "read", Single: true,
+		Summary: "Look up taxonomic classification for a species", URIType: "taxon", Resolver: true,
+		Args: []kit.Arg{{Name: "name", Help: "scientific name"}}},
+		getTaxon)
+
+	kit.Handle(app, kit.OpMeta{Name: "datasets", Group: "read", List: true,
+		Summary: "List contributing datasets"},
+		listDatasets)
+
+	kit.Handle(app, kit.OpMeta{Name: "stats", Group: "read", Single: true,
+		Summary: "Show global OBIS statistics"},
+		getStats)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the OBIS client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,86 +87,100 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type occurrenceIn struct {
+	Name   string  `kit:"arg"          help:"scientific name to search for"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type taxonIn struct {
+	Name   string  `kit:"arg"    help:"scientific name"`
+	Client *Client `kit:"inject"`
+}
+
+type datasetsIn struct {
 	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
+}
+
+type statsIn struct {
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchOccurrences(ctx context.Context, in occurrenceIn, emit func(*Occurrence) error) error {
+	occs, _, err := in.Client.SearchOccurrences(ctx, in.Name, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, o := range occs {
+		if err := emit(o); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full obis.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized obis reference: %q", input)
+func getTaxon(ctx context.Context, in taxonIn, emit func(*Taxon) error) error {
+	taxa, err := in.Client.GetTaxon(ctx, in.Name)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	for _, t := range taxa {
+		if err := emit(t); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("obis has no resource type %q", uriType)
+func listDatasets(ctx context.Context, in datasetsIn, emit func(*Dataset) error) error {
+	datasets, _, err := in.Client.ListDatasets(ctx, in.Limit)
+	if err != nil {
+		return err
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	for _, d := range datasets {
+		if err := emit(d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getStats(ctx context.Context, in statsIn, emit func(*Stats) error) error {
+	s, err := in.Client.GetStats(ctx)
+	if err != nil {
+		return err
+	}
+	return emit(s)
+}
+
+// --- Resolver: URI-native string functions ---
+
+// Classify turns any accepted input into (type, id). Any non-empty string
+// maps to ("occurrence", input) so it is addressable as a resource URI.
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("obis: empty reference")
+	}
+	return "occurrence", input, nil
+}
+
+// Locate returns the live HTTPS URL for a (type, id).
+func (Domain) Locate(uriType, id string) (string, error) {
+	switch uriType {
+	case "taxon":
+		return "https://obis.org/taxon/" + id, nil
+	default:
+		return "https://obis.org", nil
+	}
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+// taxonIDStr converts a numeric taxon ID to a string for Taxon.ID.
+func taxonIDStr(id int) string {
+	return strconv.Itoa(id)
 }
